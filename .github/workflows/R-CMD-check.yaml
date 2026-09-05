@@ -4,7 +4,33 @@
 # NOTE: This workflow is overkill for most R packages and
 # check-standard.yaml is likely a better choice.
 # usethis::use_github_action("check-standard") will install it.
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch with a `leg` input, so racecar can trigger a run and
+#      choose baseline vs instrumented. Upstream only fires on push/PR.
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action together. `chalk:` is the single variable separating
+#      the two arms, and `profile:` selects the observables profile.
+#   3. permissions: id-token: write for the action's OIDC connect. Declaring the
+#      block also zeroes every unlisted scope, so the rest is restated.
+#   4. A fail-closed assertion on the instrumented arm.
+# Build and test COMMANDS are byte-identical to upstream.
+
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   push:
     branches: [main, master]
   pull_request:
@@ -12,7 +38,29 @@ on:
 
 name: R-CMD-check.yaml
 
-permissions: read-all
+run-name: "R-CMD-check.yaml ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
+# Upstream was `read-all`. id-token: write cannot be added to that shorthand, and
+# declaring a block zeroes every unlisted scope, so read-all is restated in full.
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  deployments: read
+  discussions: read
+  issues: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  security-events: read
+  statuses: read
+  id-token: write
+
+env:
+  # The one variable that separates the arms. On baseline, action-checkout skips
+  # its Set up Chalk step entirely.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
 
 jobs:
   R-CMD-check:
@@ -24,12 +72,9 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - {os: macos-latest,   r: 'release'}
-
-          - {os: windows-latest, r: 'release'}
-          # use 4.0 or 4.1 to check with rtools40's older compiler
-          - {os: windows-latest, r: 'oldrel-4'}
-
+          # macos-latest (release) and windows-latest (release, oldrel-4) removed:
+          # observables only run on linux x86_64/aarch64. The two Windows-only
+          # steps below are left in place; their `if:` guards now never fire.
           - {os: ubuntu-latest,  r: 'devel', http-user-agent: 'release'}
           - {os: ubuntu-latest,  r: 'release'}
           - {os: ubuntu-latest,  r: 'oldrel-1'}
@@ -48,7 +93,19 @@ jobs:
       VDIFFR_LOG_PATH: "../vdiffr.Rout.fail"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - uses: r-lib/actions/setup-pandoc@v2
 
